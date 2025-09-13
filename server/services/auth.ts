@@ -4,12 +4,26 @@ import { logger } from '../utils/logger';
 import type { ShopSettings, InsertShopSettings } from '@shared/schema';
 
 export class AuthService {
-  private readonly ENCRYPTION_KEY = process.env.SESSION_SECRET || 'default_secret_key_32_characters';
+  private readonly ENCRYPTION_KEY: Buffer;
   private readonly ALGORITHM = 'aes-256-gcm';
 
+  constructor() {
+    if (!process.env.SESSION_SECRET) {
+      throw new Error('SESSION_SECRET environment variable is required for secure token encryption');
+    }
+    
+    if (process.env.SESSION_SECRET.length < 16) {
+      throw new Error('SESSION_SECRET must be at least 16 characters long');
+    }
+    
+    // Derive 32-byte key from SESSION_SECRET using SHA-256
+    this.ENCRYPTION_KEY = crypto.createHash('sha256').update(process.env.SESSION_SECRET).digest();
+  }
+
   encryptToken(token: string): { encrypted: string; iv: string; tag: string } {
-    const iv = crypto.randomBytes(16);
-    const cipher = crypto.createCipher(this.ALGORITHM, this.ENCRYPTION_KEY);
+    // Use 12-byte IV for GCM mode (best practice)
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv(this.ALGORITHM, this.ENCRYPTION_KEY, iv);
     
     let encrypted = cipher.update(token, 'utf8', 'hex');
     encrypted += cipher.final('hex');
@@ -24,7 +38,8 @@ export class AuthService {
   }
 
   decryptToken(encryptedData: { encrypted: string; iv: string; tag: string }): string {
-    const decipher = crypto.createDecipher(this.ALGORITHM, this.ENCRYPTION_KEY);
+    const iv = Buffer.from(encryptedData.iv, 'hex');
+    const decipher = crypto.createDecipheriv(this.ALGORITHM, this.ENCRYPTION_KEY, iv);
     decipher.setAuthTag(Buffer.from(encryptedData.tag, 'hex'));
     
     let decrypted = decipher.update(encryptedData.encrypted, 'hex', 'utf8');
@@ -47,17 +62,17 @@ export class AuthService {
       const existingShop = await storage.getShopSettings(shopDomain);
 
       if (existingShop) {
-        // Update existing shop
+        // Update existing shop - only store encrypted token
         return storage.updateShopSettings(shopDomain, {
-          accessToken, // Store plain text for development - in production, only store encrypted
+          accessToken: process.env.NODE_ENV === 'development' ? accessToken : null,
           encryptedToken,
           tokenScope: scope,
         });
       } else {
-        // Create new shop
+        // Create new shop - only store encrypted token in production
         const shopData: InsertShopSettings = {
           shopDomain,
-          accessToken, // Store plain text for development
+          accessToken: process.env.NODE_ENV === 'development' ? accessToken : null,
           encryptedToken,
           tokenScope: scope,
           showVendorColumn: true,
@@ -85,15 +100,15 @@ export class AuthService {
         return null;
       }
 
-      // For development, return plain text token
-      if (shopSettings.accessToken) {
+      // For development, return plain text token if available
+      if (process.env.NODE_ENV === 'development' && shopSettings.accessToken) {
         return {
           accessToken: shopSettings.accessToken,
           scope: shopSettings.tokenScope || undefined,
         };
       }
 
-      // In production, decrypt the token
+      // Decrypt the token (production or fallback)
       if (shopSettings.encryptedToken) {
         const encryptedData = JSON.parse(shopSettings.encryptedToken);
         const accessToken = this.decryptToken(encryptedData);

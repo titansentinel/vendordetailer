@@ -1,5 +1,5 @@
 import { storage } from '../storage';
-import { createShopifyService } from './shopify';
+import { createShopifyService, type BulkUpdateResult } from './shopify';
 import { logger } from '../utils/logger';
 import type { BulkJob, InsertBulkJob } from '@shared/schema';
 
@@ -73,59 +73,109 @@ export class BulkJobProcessor {
       const shopifyService = createShopifyService(job.shopDomain, shopSettings.accessToken);
 
       // Process products in batches to avoid rate limits
-      const batchSize = 50;
+      const batchSize = 10; // Reduced batch size for individual API calls
       let processedCount = 0;
+      let successCount = 0;
+      let failureCount = 0;
+      const allErrors: string[] = [];
 
       for (let i = 0; i < job.productIds.length; i += batchSize) {
         const batch = job.productIds.slice(i, i + batchSize);
         
         try {
-          const result = await shopifyService.bulkUpdateVendor(batch, job.targetVendor);
+          const result: BulkUpdateResult = await shopifyService.bulkUpdateVendor(batch, job.targetVendor);
           
-          if (result.productBulkUpdate.userErrors.length > 0) {
-            logger.warn('Batch update had errors', {
-              jobId,
-              batch: i / batchSize + 1,
-              errors: result.productBulkUpdate.userErrors,
-            });
-          }
-
+          // Track actual successes and failures
+          successCount += result.successCount;
+          failureCount += result.failureCount;
           processedCount += batch.length;
+          
+          // Log detailed results for this batch
+          logger.info('Batch processing completed', {
+            jobId,
+            batchNumber: Math.floor(i / batchSize) + 1,
+            batchSize: batch.length,
+            successCount: result.successCount,
+            failureCount: result.failureCount,
+            totalSuccessCount: successCount,
+            totalFailureCount: failureCount,
+          });
+          
+          // Log user errors if any
+          if (result.userErrors.length > 0) {
+            logger.warn('Batch update had user errors', {
+              jobId,
+              batchNumber: Math.floor(i / batchSize) + 1,
+              userErrors: result.userErrors,
+            });
+            allErrors.push(...result.userErrors.map(ue => 
+              `Product ${ue.productId}: ${ue.message} (field: ${ue.field})`
+            ));
+          }
+          
+          // Log API errors if any
+          if (result.errors.length > 0) {
+            logger.warn('Batch update had API errors', {
+              jobId,
+              batchNumber: Math.floor(i / batchSize) + 1,
+              apiErrors: result.errors,
+            });
+            allErrors.push(...result.errors.map(e => 
+              `Product ${e.productId}: ${e.error}`
+            ));
+          }
           
           // Update progress
           await storage.updateBulkJob(jobId, { 
             processedCount,
           });
 
-          // Add delay to respect rate limits
-          if (i + batchSize < job.productIds.length) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
-
         } catch (error) {
-          logger.error('Batch processing failed', {
+          logger.error('Batch processing completely failed', {
             jobId,
-            batch: i / batchSize + 1,
+            batchNumber: Math.floor(i / batchSize) + 1,
+            batchSize: batch.length,
             error: error instanceof Error ? error.message : 'Unknown error',
           });
           
-          // Continue with next batch instead of failing entire job
+          // Mark all products in this batch as failed
+          failureCount += batch.length;
           processedCount += batch.length;
+          allErrors.push(`Batch ${Math.floor(i / batchSize) + 1}: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
       }
 
-      // Mark job as completed
+      // Determine final job status based on results
+      const finalStatus = failureCount === 0 ? 'SUCCESS' : 'FAILED'; // Any failures mark job as FAILED
+      
+      const errorMessage = allErrors.length > 0 ? 
+        `${failureCount} products failed. Errors: ${allErrors.slice(0, 5).join('; ')}${allErrors.length > 5 ? '...' : ''}` : 
+        null;
+
       await storage.updateBulkJob(jobId, {
-        status: 'SUCCESS',
+        status: finalStatus,
         processedCount,
+        errorMessage,
         completedAt: new Date(),
       });
 
-      logger.info('Job completed successfully', {
+      logger.info('Job processing completed', {
         jobId,
-        processedCount,
+        status: finalStatus,
         totalCount: job.totalCount,
+        processedCount,
+        successCount,
+        failureCount,
+        hasErrors: allErrors.length > 0,
       });
+      
+      if (failureCount > 0) {
+        logger.warn('Job completed with failures', {
+          jobId,
+          successRate: Math.round((successCount / job.totalCount) * 100),
+          errorSummary: allErrors.slice(0, 10), // Log first 10 errors for debugging
+        });
+      }
 
     } catch (error) {
       logger.error('Job processing failed', {
